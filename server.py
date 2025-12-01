@@ -392,7 +392,7 @@ async def call_tool(name: str, args: Any) -> List[types.TextContent]:
         return [types.TextContent(type="text", text=md_error(str(e)))]
 
 # ---------------------------------------------------------------------------
-# Server
+# Server - Raw ASGI handlers for SSE
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -402,24 +402,27 @@ async def lifespan(app):
     logger.info("MCP Shell Server stopping")
 
 
-async def handle_sse(request: Request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+async def handle_sse(scope, receive, send):
+    """Raw ASGI handler for SSE connections."""
+    async with sse.connect_sse(scope, receive, send) as streams:
         await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
 
 
-async def handle_messages(request: Request):
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+async def handle_messages(scope, receive, send):
+    """Raw ASGI handler for POST messages."""
+    await sse.handle_post_message(scope, receive, send)
 
 
 async def health(request: Request):
-    return JSONResponse({"status": "ok"})
+    """Health check - can use normal Starlette pattern."""
+    return JSONResponse({"status": "ok", "tools": 5})
 
 
 app = Starlette(
     routes=[
-        Route("/sse", endpoint=handle_sse),
-        Route("/messages", endpoint=handle_messages, methods=["POST"]),
-        Route("/health", endpoint=health),
+        Route("/sse", handle_sse),
+        Route("/messages", handle_messages, methods=["POST"]),
+        Route("/health", health),
     ],
     lifespan=lifespan,
 )
