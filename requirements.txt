@@ -1,0 +1,9 @@
+# Core MCP server
+starlette
+uvicorn
+mcp
+
+# HTTP + parsing
+httpx
+beautifulsoup4
+markdownify
