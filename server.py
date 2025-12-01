@@ -13,12 +13,7 @@ import zipfile
 import io
 from typing import Any, List
 from pathlib import Path
-from contextlib import asynccontextmanager
 
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 from mcp.server.sse import SseServerTransport
 from mcp.server import Server
 import mcp.types as types
@@ -392,42 +387,55 @@ async def call_tool(name: str, args: Any) -> List[types.TextContent]:
         return [types.TextContent(type="text", text=md_error(str(e)))]
 
 # ---------------------------------------------------------------------------
-# Server - Raw ASGI handlers for SSE
+# Server - Minimal ASGI app (no Starlette routing issues)
 # ---------------------------------------------------------------------------
 
-@asynccontextmanager
-async def lifespan(app):
-    logger.info("MCP Shell Server starting")
-    yield
-    logger.info("MCP Shell Server stopping")
-
-
-class SSEHandler:
-    """Raw ASGI handler for SSE connections."""
-    async def __call__(self, scope, receive, send):
-        async with sse.connect_sse(scope, receive, send) as streams:
-            await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
-
-
-class MessagesHandler:
-    """Raw ASGI handler for POST messages."""
-    async def __call__(self, scope, receive, send):
-        await sse.handle_post_message(scope, receive, send)
-
-
-async def health(request: Request):
-    """Health check - can use normal Starlette pattern."""
-    return JSONResponse({"status": "ok", "tools": 5})
-
-
-app = Starlette(
-    routes=[
-        Route("/sse", app=SSEHandler()),
-        Route("/messages", app=MessagesHandler(), methods=["POST"]),
-        Route("/health", health),
-    ],
-    lifespan=lifespan,
-)
+async def app(scope, receive, send):
+    """Minimal ASGI app with manual routing."""
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                logger.info("MCP Shell Server starting")
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                logger.info("MCP Shell Server stopping")
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+    
+    elif scope["type"] == "http":
+        path = scope["path"]
+        method = scope["method"]
+        
+        if path == "/sse" and method == "GET":
+            async with sse.connect_sse(scope, receive, send) as streams:
+                await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+        
+        elif path == "/messages" and method == "POST":
+            await sse.handle_post_message(scope, receive, send)
+        
+        elif path == "/health" and method == "GET":
+            body = b'{"status":"ok","tools":5}'
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [[b"content-type", b"application/json"]],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": body,
+            })
+        
+        else:
+            await send({
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [[b"content-type", b"text/plain"]],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b"Not Found",
+            })
 
 if __name__ == "__main__":
     import uvicorn
