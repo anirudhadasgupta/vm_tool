@@ -402,15 +402,17 @@ async def lifespan(app):
     logger.info("MCP Shell Server stopping")
 
 
-async def handle_sse(scope, receive, send):
+class SSEHandler:
     """Raw ASGI handler for SSE connections."""
-    async with sse.connect_sse(scope, receive, send) as streams:
-        await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+    async def __call__(self, scope, receive, send):
+        async with sse.connect_sse(scope, receive, send) as streams:
+            await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
 
 
-async def handle_messages(scope, receive, send):
+class MessagesHandler:
     """Raw ASGI handler for POST messages."""
-    await sse.handle_post_message(scope, receive, send)
+    async def __call__(self, scope, receive, send):
+        await sse.handle_post_message(scope, receive, send)
 
 
 async def health(request: Request):
@@ -420,8 +422,8 @@ async def health(request: Request):
 
 app = Starlette(
     routes=[
-        Route("/sse", handle_sse),
-        Route("/messages", handle_messages, methods=["POST"]),
+        Route("/sse", app=SSEHandler()),
+        Route("/messages", app=MessagesHandler(), methods=["POST"]),
         Route("/health", health),
     ],
     lifespan=lifespan,
