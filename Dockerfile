@@ -70,7 +70,7 @@ RUN mkdir -p -m 755 /etc/apt/keyrings && \
     apt-get update && apt-get install -y gh && \
     rm -rf /var/lib/apt/lists/*
 
-# 5. Download Cloud SQL Proxy (v2) into a standard path
+# 5. Download Cloud SQL Proxy (v2)
 RUN curl -fsSL \
       https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.19.0/cloud-sql-proxy.linux.amd64 \
       -o /usr/local/bin/cloud-sql-proxy && \
@@ -79,42 +79,35 @@ RUN curl -fsSL \
 # 6. Setup Python app
 WORKDIR /app
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy server
 COPY server.py .
 
-# Create workspace directory
+# Workspace for your other tooling
 RUN mkdir -p /app/workspace
 
-# Configure git defaults (useful for commits)
+# Git defaults (optional)
 RUN git config --system init.defaultBranch main && \
     git config --system advice.detachedHead false
 
 # ---------- Runtime configuration ----------
 
-# Cloud SQL / Postgres configuration via env
-# Example (you set these at deploy time):
-#   CLOUDSQL_INSTANCE=squareapp-479519:us-central1:square-app
-#   DB_HOST=127.0.0.1
-#   DB_PORT=5432
-#   DB_USER=app_user
-#   DB_PASSWORD=new_secure_password
-#   DB_NAME=app_db
-#
-# Then your apps can use DATABASE_URL built from those.
+# Cloud SQL / DB envs (examples; you’ll set these at deploy time)
+# CLOUDSQL_INSTANCE=squareapp-479519:us-central1:square-app
+# DB_HOST=127.0.0.1
+# DB_PORT=5432
 ENV DB_HOST=127.0.0.1 \
-    DB_PORT=5432
+    DB_PORT=5432 \
+    PORT=8080
 
-# Default port for your Python server (Cloud Run convention)
-ENV PORT=8040
-
-# Copy entrypoint script
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-# Use the entrypoint to start Cloud SQL Proxy (if configured) and then server.py
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["python", "server.py"]
+# Single-shot CMD: start proxy (if CLOUDSQL_INSTANCE set), wait a bit, then start server.py
+CMD bash -lc '\
+  if [[ -n "${CLOUDSQL_INSTANCE}" ]]; then \
+    echo "[CMD] Starting Cloud SQL Proxy for ${CLOUDSQL_INSTANCE} on ${DB_PORT}"; \
+    cloud-sql-proxy "${CLOUDSQL_INSTANCE}" --address 0.0.0.0 --port "${DB_PORT}" >/var/log/cloud-sql-proxy.log 2>&1 & \
+    sleep 5; \
+  fi; \
+  echo "[CMD] Starting server.py on PORT=${PORT}"; \
+  python server.py \
+'
