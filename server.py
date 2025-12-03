@@ -29,7 +29,7 @@ WORKSPACE = Path("/app/workspace").resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 MAX_OUTPUT = 500_000  # 500KB
-DEFAULT_TIMEOUT = 300
+DEFAULT_TIMEOUT = 3600
 
 mcp = Server("shell-mcp")
 sse = SseServerTransport("/messages")
@@ -112,6 +112,13 @@ ENV_INFO = """
 
 ## ⚠️ EPHEMERAL SESSION
 This environment resets between chat sessions. Clone repos fresh each time.
+
+## Environment Details
+- Timeout: 3600
+- OS: Debian
+- RAM: 16 GB
+- vCPU: 4 core
+- CloudSQL (PostGres) attached
 
 ## Workspace
 - Location: /app/workspace
@@ -439,4 +446,4 @@ async def app(scope, receive, send):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8040)))
