@@ -99,7 +99,7 @@ RUN git config --system init.defaultBranch main && \
 # DB_PORT=5432
 ENV DB_HOST=127.0.0.1 \
     DB_PORT=5432 \
-    PORT=8080
+    PORT=8040
 
 # Single-shot CMD: start proxy (if CLOUDSQL_INSTANCE set), wait a bit, then start server.py
 CMD bash -lc '\
