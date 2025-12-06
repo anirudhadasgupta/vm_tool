@@ -16,6 +16,7 @@ from pathlib import Path
 
 from mcp.server.sse import SseServerTransport
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 import mcp.types as types
 
 # ---------------------------------------------------------------------------
@@ -31,7 +32,7 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 MAX_OUTPUT = 500_000  # 500KB
 DEFAULT_TIMEOUT = 3600
 
-mcp = Server("shell-mcp")
+mcp = Server("vmtool")
 sse = SseServerTransport("/messages")
 
 # ---------------------------------------------------------------------------
@@ -195,6 +196,8 @@ git push origin feature
 - fd is much faster than find
 """
 
+ENV_RESOURCE_URI = "vmtool://resources/environment"
+
 # ---------------------------------------------------------------------------
 # Core: Async Shell Execution
 # ---------------------------------------------------------------------------
@@ -219,6 +222,32 @@ async def shell(cmd: str, timeout: int = DEFAULT_TIMEOUT, cwd: Path = WORKSPACE)
         return -1, "", f"Timeout after {timeout}s"
     except Exception as e:
         return -1, "", f"Error: {e}"
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+
+@mcp.list_resources()
+async def list_resources() -> list[types.Resource]:
+    """Expose static resources available from the MCP server."""
+    return [
+        types.Resource(
+            name="environment",
+            title="vmtool environment",
+            uri=ENV_RESOURCE_URI,
+            description="Shell environment details, tools, and usage tips for vmtool.",
+            mimeType="text/markdown",
+            annotations={"readOnlyHint": True},
+        )
+    ]
+
+
+@mcp.read_resource()
+async def read_resource(uri: str):
+    if uri == ENV_RESOURCE_URI:
+        return [ReadResourceContents(content=ENV_INFO, mime_type="text/markdown")]
+    raise ValueError(f"Unknown resource: {uri}")
 
 # ---------------------------------------------------------------------------
 # Tools - Minimal Set
