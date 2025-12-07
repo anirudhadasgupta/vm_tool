@@ -12,9 +12,13 @@ import logging
 import base64
 import zipfile
 import io
-from typing import Any, List
+import time
+import uuid
+import json
+from typing import Any, List, Dict, Optional
 from pathlib import Path
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 from mcp.server.sse import SseServerTransport
 from mcp.server import Server
@@ -50,6 +54,66 @@ repo_index_cache: dict[str, Any] = {
     "built_at": None,
     "total_size": 0,
 }
+
+# ---------------------------------------------------------------------------
+# Session Management - Track active SSE connections
+# ---------------------------------------------------------------------------
+
+# Session tracking for better error messages and reconnection handling
+active_sessions: Dict[str, Dict[str, Any]] = {}
+SESSION_TIMEOUT = 3600  # 1 hour - sessions older than this are considered stale
+KEEP_ALIVE_INTERVAL = 30  # Send keep-alive every 30 seconds
+
+
+def register_session(session_id: str) -> None:
+    """Register a new SSE session."""
+    active_sessions[session_id] = {
+        "created_at": time.time(),
+        "last_activity": time.time(),
+        "message_count": 0,
+    }
+    logger.info("Session registered: %s (total active: %d)", session_id[:8], len(active_sessions))
+
+
+def update_session_activity(session_id: str) -> bool:
+    """Update session activity timestamp. Returns False if session not found."""
+    if session_id in active_sessions:
+        active_sessions[session_id]["last_activity"] = time.time()
+        active_sessions[session_id]["message_count"] += 1
+        return True
+    return False
+
+
+def unregister_session(session_id: str) -> None:
+    """Unregister an SSE session."""
+    if session_id in active_sessions:
+        session = active_sessions.pop(session_id)
+        duration = time.time() - session["created_at"]
+        logger.info(
+            "Session closed: %s (duration: %.1fs, messages: %d)",
+            session_id[:8],
+            duration,
+            session["message_count"],
+        )
+
+
+def cleanup_stale_sessions() -> int:
+    """Remove sessions that haven't been active for SESSION_TIMEOUT. Returns count removed."""
+    now = time.time()
+    stale = [
+        sid for sid, info in active_sessions.items()
+        if now - info["last_activity"] > SESSION_TIMEOUT
+    ]
+    for sid in stale:
+        logger.warning("Removing stale session: %s", sid[:8])
+        active_sessions.pop(sid, None)
+    return len(stale)
+
+
+def get_session_info(session_id: str) -> Optional[Dict[str, Any]]:
+    """Get session info if it exists."""
+    return active_sessions.get(session_id)
+
 
 suggested_namespace = sanitize_namespace(os.environ.get("VMTOOL_NAMESPACE", DEFAULT_NAMESPACE))
 mcp = Server(suggested_namespace)
@@ -774,8 +838,51 @@ async def call_tool(name: str, args: Any) -> List[types.TextContent]:
 # Server - Minimal ASGI app (no Starlette routing issues)
 # ---------------------------------------------------------------------------
 
+
+def parse_query_string(query_string: bytes) -> Dict[str, str]:
+    """Parse query string into a dictionary."""
+    params = {}
+    if query_string:
+        for pair in query_string.decode("utf-8").split("&"):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                params[key] = value
+    return params
+
+
+async def send_json_response(send, status: int, data: dict) -> None:
+    """Send a JSON response."""
+    body = json.dumps(data).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            [b"content-type", b"application/json"],
+            [b"access-control-allow-origin", b"*"],
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": body,
+    })
+
+
+async def send_error_response(send, status: int, error: str, details: str = None) -> None:
+    """Send an error response with clear messaging."""
+    data = {
+        "error": error,
+        "status": status,
+    }
+    if details:
+        data["details"] = details
+    if status == 404 and "session" in error.lower():
+        data["action"] = "reconnect"
+        data["hint"] = "The SSE connection has expired. Please establish a new connection to /sse"
+    await send_json_response(send, status, data)
+
+
 async def app(scope, receive, send):
-    """Minimal ASGI app with manual routing."""
+    """Minimal ASGI app with manual routing and session management."""
     if scope["type"] == "lifespan":
         while True:
             message = await receive()
@@ -783,47 +890,125 @@ async def app(scope, receive, send):
                 logger.info("MCP Shell Server starting")
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
-                logger.info("MCP Shell Server stopping")
+                logger.info("MCP Shell Server stopping - cleaning up %d sessions", len(active_sessions))
+                active_sessions.clear()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
-    
+
     elif scope["type"] == "http":
         path = scope["path"]
         method = scope["method"]
-        
+        query_params = parse_query_string(scope.get("query_string", b""))
+
+        # SSE connection endpoint - main entry point for MCP clients
         if path == "/sse" and method == "GET":
-            async with sse.connect_sse(scope, receive, send) as streams:
-                await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
-        
+            # Generate a session ID for tracking
+            session_id = str(uuid.uuid4())
+            register_session(session_id)
+
+            try:
+                # Clean up stale sessions periodically
+                cleanup_stale_sessions()
+
+                async with sse.connect_sse(scope, receive, send) as streams:
+                    logger.info("SSE connection established: %s", session_id[:8])
+                    await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+            except Exception as e:
+                logger.error("SSE connection error for session %s: %s", session_id[:8], str(e))
+            finally:
+                unregister_session(session_id)
+
+        # Message relay endpoint - receives POST messages for SSE streams
         elif path == "/messages" and method == "POST":
-            await sse.handle_post_message(scope, receive, send)
-        
+            try:
+                # Try to handle the message
+                await sse.handle_post_message(scope, receive, send)
+            except Exception as e:
+                error_msg = str(e)
+                logger.warning("Message handling error: %s", error_msg)
+
+                # Check if this is a session-related error
+                if "not found" in error_msg.lower() or "session" in error_msg.lower():
+                    await send_error_response(
+                        send,
+                        404,
+                        "Session not found",
+                        "The SSE session has expired or was never established. "
+                        "This typically happens after long idle periods or network disconnections. "
+                        "Please reconnect by establishing a new SSE connection to /sse"
+                    )
+                else:
+                    await send_error_response(
+                        send,
+                        500,
+                        "Message handling failed",
+                        error_msg
+                    )
+
+        # Health check endpoint - enhanced with session info
         elif path == "/health" and method == "GET":
-            body = (
-                f'{{"status":"ok","tools":{len(TOOLS)},"namespace":"{suggested_namespace}"}}'.encode(
-                    "utf-8"
-                )
-            )
-            await send({
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [[b"content-type", b"application/json"]],
+            # Clean up stale sessions on health check
+            stale_count = cleanup_stale_sessions()
+
+            health_data = {
+                "status": "ok",
+                "tools": len(TOOLS),
+                "namespace": suggested_namespace,
+                "active_sessions": len(active_sessions),
+                "stale_sessions_cleaned": stale_count,
+            }
+            await send_json_response(send, 200, health_data)
+
+        # Ping endpoint - for keep-alive checks
+        elif path == "/ping" and method == "GET":
+            await send_json_response(send, 200, {
+                "pong": True,
+                "timestamp": time.time(),
+                "active_sessions": len(active_sessions),
             })
-            await send({
-                "type": "http.response.body",
-                "body": body,
-            })
-        
+
+        # Session info endpoint - check if a session is still valid
+        elif path == "/session" and method == "GET":
+            session_id = query_params.get("id", "")
+            if session_id:
+                session_info = get_session_info(session_id)
+                if session_info:
+                    await send_json_response(send, 200, {
+                        "valid": True,
+                        "session_id": session_id[:8] + "...",
+                        "age_seconds": time.time() - session_info["created_at"],
+                        "last_activity_seconds_ago": time.time() - session_info["last_activity"],
+                        "message_count": session_info["message_count"],
+                    })
+                else:
+                    await send_error_response(
+                        send,
+                        404,
+                        "Session not found",
+                        f"Session {session_id[:8]}... does not exist or has expired"
+                    )
+            else:
+                # Return list of active sessions (for debugging)
+                sessions = [
+                    {
+                        "id": sid[:8] + "...",
+                        "age_seconds": time.time() - info["created_at"],
+                        "messages": info["message_count"],
+                    }
+                    for sid, info in active_sessions.items()
+                ]
+                await send_json_response(send, 200, {
+                    "active_sessions": len(sessions),
+                    "sessions": sessions[:10],  # Limit to first 10
+                })
+
         else:
-            await send({
-                "type": "http.response.start",
-                "status": 404,
-                "headers": [[b"content-type", b"text/plain"]],
-            })
-            await send({
-                "type": "http.response.body",
-                "body": b"Not Found",
-            })
+            await send_error_response(
+                send,
+                404,
+                "Endpoint not found",
+                f"Path '{path}' does not exist. Available endpoints: /sse (GET), /messages (POST), /health (GET), /ping (GET), /session (GET)"
+            )
 
 if __name__ == "__main__":
     import uvicorn
