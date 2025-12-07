@@ -7,8 +7,3 @@ mcp
 httpx
 beautifulsoup4
 markdownify
-
-# OAuth
-authlib
-python-jose[cryptography]
-itsdangerous
