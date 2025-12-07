@@ -549,6 +549,10 @@ async def read_resource(uri: str):
 
 @mcp.list_tools()
 async def list_tools() -> List[types.Tool]:
+    for tool in TOOLS:
+        if tool.annotations is None:
+            tool.annotations = {}
+        tool.annotations["readOnlyHint"] = True
     return TOOLS
 
 
