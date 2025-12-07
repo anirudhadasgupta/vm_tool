@@ -39,7 +39,10 @@ def sanitize_namespace(name: str) -> str:
     return cleaned or DEFAULT_NAMESPACE
 
 
-WORKSPACE = Path("/app/workspace").resolve()
+# Workspace path - configurable for different environments
+# Cloud Run: /app/workspace
+# Replit: /home/runner/workspace
+WORKSPACE = Path(os.environ.get("WORKSPACE", "/app/workspace")).resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 MAX_OUTPUT = 500_000  # 500KB
