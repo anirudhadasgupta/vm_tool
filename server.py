@@ -28,6 +28,15 @@ import mcp.types as types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-ide")
 
+DEFAULT_NAMESPACE = "vmtool"
+
+
+def sanitize_namespace(name: str) -> str:
+    """Normalize the namespace used to expose tools to the client."""
+
+    cleaned = name.strip().replace(" ", "-").replace("/", "-")
+    return cleaned or DEFAULT_NAMESPACE
+
 WORKSPACE = Path("/app/workspace").resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
@@ -42,8 +51,11 @@ repo_index_cache: dict[str, Any] = {
     "total_size": 0,
 }
 
-mcp = Server("vmtool")
+suggested_namespace = sanitize_namespace(os.environ.get("VMTOOL_NAMESPACE", DEFAULT_NAMESPACE))
+mcp = Server(suggested_namespace)
 sse = SseServerTransport("/messages")
+
+logger.info("vmtool namespace: %s", suggested_namespace)
 
 # ---------------------------------------------------------------------------
 # Markdown Response Formatters
@@ -118,12 +130,20 @@ def md_export(path: str, size: int, b64: str, preview: str = None) -> str:
 # Environment Guide
 # ---------------------------------------------------------------------------
 
-ENV_INFO = """
+def build_env_info(namespace: str) -> str:
+    tool_paths = "\n".join(f"- /{namespace}/{tool.name}" for tool in TOOLS)
+
+    return f"""
 # MCP Shell Environment
 
 ## ⚠️ EPHEMERAL SESSION
 This environment resets between chat sessions. Clone repos fresh each time.
 If the link feels stale, call the **help** tool again to refresh context.
+
+## Server namespace & tool paths
+- Namespace: `{namespace}` (set VMTOOL_NAMESPACE to override)
+- Canonical tool paths:
+{tool_paths}
 
 ## Environment Details
 - Timeout: 3600
@@ -366,42 +386,6 @@ async def shell(cmd: str, timeout: int = DEFAULT_TIMEOUT, cwd: Path = WORKSPACE)
         return -1, "", f"Error: {e}"
 
 # ---------------------------------------------------------------------------
-# Resources
-# ---------------------------------------------------------------------------
-
-
-@mcp.list_resources()
-async def list_resources() -> list[types.Resource]:
-    """Expose static resources available from the MCP server."""
-    return [
-        types.Resource(
-            name="environment",
-            title="vmtool environment",
-            uri=ENV_RESOURCE_URI,
-            description="Shell environment details, tools, and usage tips for vmtool.",
-            mimeType="text/markdown",
-            annotations={"readOnlyHint": True},
-        ),
-        types.Resource(
-            name="repo-tools",
-            title="Repository utilities",
-            uri=REPO_RESOURCE_URI,
-            description="Usage guide for repo_map, read_module, index_repo, and search_repo tools.",
-            mimeType="text/markdown",
-            annotations={"readOnlyHint": True},
-        ),
-    ]
-
-
-@mcp.read_resource()
-async def read_resource(uri: str):
-    if uri == ENV_RESOURCE_URI:
-        return [ReadResourceContents(content=ENV_INFO, mime_type="text/markdown")]
-    if uri == REPO_RESOURCE_URI:
-        return [ReadResourceContents(content=REPO_TOOLS_INFO, mime_type="text/markdown")]
-    raise ValueError(f"Unknown resource: {uri}")
-
-# ---------------------------------------------------------------------------
 # Tools - Minimal Set
 # ---------------------------------------------------------------------------
 
@@ -537,6 +521,44 @@ For directory: creates zip and returns base64""",
         },
     ),
 ]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+ENV_INFO = build_env_info(suggested_namespace)
+
+
+@mcp.list_resources()
+async def list_resources() -> list[types.Resource]:
+    """Expose static resources available from the MCP server."""
+    return [
+        types.Resource(
+            name="environment",
+            title="vmtool environment",
+            uri=ENV_RESOURCE_URI,
+            description="Shell environment details, tools, and usage tips for vmtool.",
+            mimeType="text/markdown",
+            annotations={"readOnlyHint": True},
+        ),
+        types.Resource(
+            name="repo-tools",
+            title="Repository utilities",
+            uri=REPO_RESOURCE_URI,
+            description="Usage guide for repo_map, read_module, index_repo, and search_repo tools.",
+            mimeType="text/markdown",
+            annotations={"readOnlyHint": True},
+        ),
+    ]
+
+
+@mcp.read_resource()
+async def read_resource(uri: str):
+    if uri == ENV_RESOURCE_URI:
+        return [ReadResourceContents(content=ENV_INFO, mime_type="text/markdown")]
+    if uri == REPO_RESOURCE_URI:
+        return [ReadResourceContents(content=REPO_TOOLS_INFO, mime_type="text/markdown")]
+    raise ValueError(f"Unknown resource: {uri}")
 
 # ---------------------------------------------------------------------------
 # Tool Handlers
@@ -777,7 +799,11 @@ async def app(scope, receive, send):
             await sse.handle_post_message(scope, receive, send)
         
         elif path == "/health" and method == "GET":
-            body = b'{"status":"ok","tools":9}'
+            body = (
+                f'{{"status":"ok","tools":{len(TOOLS)},"namespace":"{suggested_namespace}"}}'.encode(
+                    "utf-8"
+                )
+            )
             await send({
                 "type": "http.response.start",
                 "status": 200,
