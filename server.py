@@ -53,28 +53,48 @@ DEFAULT_TIMEOUT = 3600
 EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
 
 # ---------------------------------------------------------------------------
-# OAuth Configuration (Google)
+# OAuth Configuration
 # ---------------------------------------------------------------------------
 
-OAUTH_CLIENT_ID = os.environ.get(
+# Server base URL (for OAuth endpoints)
+SERVER_BASE_URL = os.environ.get(
+    "SERVER_BASE_URL",
+    "https://vm-tool-81258210604.us-central1.run.app"
+)
+
+# Google OAuth (used as identity provider)
+GOOGLE_CLIENT_ID = os.environ.get(
     "OAUTH_CLIENT_ID",
     "81258210604-2ie1n8a29a9sgcl0gmpj8agvjn5nja3h.apps.googleusercontent.com"
 )
-OAUTH_CLIENT_SECRET = os.environ.get(
+GOOGLE_CLIENT_SECRET = os.environ.get(
     "OAUTH_CLIENT_SECRET",
     "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"
 )
-OAUTH_REDIRECT_URI = os.environ.get(
-    "OAUTH_REDIRECT_URI",
-    "https://vm-tool-81258210604.us-central1.run.app/auth/callback"
-)
-OAUTH_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/auth"
-OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
-OAUTH_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
-OAUTH_JWKS_URI = "https://www.googleapis.com/oauth2/v3/certs"
+GOOGLE_REDIRECT_URI = f"{SERVER_BASE_URL}/oauth/google/callback"
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+# MCP OAuth Client Registry (clients like ChatGPT register here)
+# Format: client_id -> {client_secret, redirect_uris, name}
+oauth_clients: Dict[str, Dict[str, Any]] = {}
+
+# Default client for ChatGPT (can be overridden via env vars)
+DEFAULT_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "chatgpt-mcp-client")
+DEFAULT_CLIENT_SECRET = os.environ.get("MCP_CLIENT_SECRET", "mcp-client-secret-change-me")
+
+# Register default client
+oauth_clients[DEFAULT_CLIENT_ID] = {
+    "client_secret": DEFAULT_CLIENT_SECRET,
+    "redirect_uris": ["*"],  # Allow any redirect URI for flexibility
+    "name": "ChatGPT MCP Client",
+}
 
 # OAuth state storage (in production, use Redis or similar)
 oauth_states: Dict[str, Dict[str, Any]] = {}
+# Authorization codes (short-lived, exchanged for tokens)
+authorization_codes: Dict[str, Dict[str, Any]] = {}
 # Token storage keyed by access token
 oauth_tokens: Dict[str, Dict[str, Any]] = {}
 
@@ -158,11 +178,32 @@ def generate_pkce_pair() -> tuple[str, str]:
     return code_verifier, code_challenge
 
 
-def create_authorization_url(state: str, code_challenge: str) -> str:
-    """Create Google OAuth authorization URL."""
+def verify_pkce_challenge(code_verifier: str, code_challenge: str) -> bool:
+    """Verify PKCE code_verifier matches code_challenge."""
+    computed = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip("=")
+    return secrets.compare_digest(computed, code_challenge)
+
+
+def validate_oauth_client(client_id: str, client_secret: str = None, redirect_uri: str = None) -> Optional[Dict[str, Any]]:
+    """Validate OAuth client credentials."""
+    client = oauth_clients.get(client_id)
+    if not client:
+        return None
+    if client_secret and not secrets.compare_digest(client["client_secret"], client_secret):
+        return None
+    if redirect_uri and client["redirect_uris"] != ["*"]:
+        if redirect_uri not in client["redirect_uris"]:
+            return None
+    return client
+
+
+def create_google_auth_url(state: str, code_challenge: str) -> str:
+    """Create Google OAuth authorization URL (used as identity provider)."""
     params = {
-        "client_id": OAUTH_CLIENT_ID,
-        "redirect_uri": OAUTH_REDIRECT_URI,
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
         "response_type": "code",
         "scope": "openid email profile",
         "state": state,
@@ -171,21 +212,21 @@ def create_authorization_url(state: str, code_challenge: str) -> str:
         "access_type": "offline",
         "prompt": "consent",
     }
-    return f"{OAUTH_AUTHORIZATION_ENDPOINT}?{urllib.parse.urlencode(params)}"
+    return f"{GOOGLE_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}"
 
 
-async def exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, Any]:
-    """Exchange authorization code for access token."""
+async def exchange_google_code(code: str, code_verifier: str) -> Dict[str, Any]:
+    """Exchange Google authorization code for access token."""
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            OAUTH_TOKEN_ENDPOINT,
+            GOOGLE_TOKEN_ENDPOINT,
             data={
-                "client_id": OAUTH_CLIENT_ID,
-                "client_secret": OAUTH_CLIENT_SECRET,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
                 "code": code,
                 "code_verifier": code_verifier,
                 "grant_type": "authorization_code",
-                "redirect_uri": OAUTH_REDIRECT_URI,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
             },
         )
         if response.status_code != 200:
@@ -193,16 +234,46 @@ async def exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, An
         return response.json()
 
 
-async def get_user_info(access_token: str) -> Dict[str, Any]:
+async def get_google_user_info(access_token: str) -> Dict[str, Any]:
     """Get user info from Google."""
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            OAUTH_USERINFO_ENDPOINT,
+            GOOGLE_USERINFO_ENDPOINT,
             headers={"Authorization": f"Bearer {access_token}"},
         )
         if response.status_code != 200:
             raise ValueError(f"Failed to get user info: {response.text}")
         return response.json()
+
+
+def create_authorization_code(client_id: str, redirect_uri: str, user_info: Dict[str, Any],
+                               code_challenge: str = None, code_challenge_method: str = None) -> str:
+    """Create an authorization code for the OAuth flow."""
+    code = secrets.token_urlsafe(32)
+    authorization_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "user_info": user_info,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "created_at": time.time(),
+    }
+    return code
+
+
+def create_access_token(user_info: Dict[str, Any], client_id: str) -> tuple[str, int]:
+    """Create an access token and return (token, expires_in)."""
+    token = secrets.token_urlsafe(32)
+    expires_in = 3600  # 1 hour
+    oauth_tokens[token] = {
+        "user_id": user_info.get("id"),
+        "email": user_info.get("email"),
+        "name": user_info.get("name"),
+        "client_id": client_id,
+        "expires_at": time.time() + expires_in,
+        "created_at": time.time(),
+    }
+    return token, expires_in
 
 
 def validate_token(token: str) -> Optional[Dict[str, Any]]:
@@ -235,7 +306,14 @@ def cleanup_expired_oauth_states() -> int:
     ]
     for state in expired:
         oauth_states.pop(state, None)
-    return len(expired)
+    # Also clean up expired authorization codes
+    expired_codes = [
+        code for code, info in authorization_codes.items()
+        if now - info.get("created_at", 0) > 600  # 10 minute expiry
+    ]
+    for code in expired_codes:
+        authorization_codes.pop(code, None)
+    return len(expired) + len(expired_codes)
 
 
 suggested_namespace = sanitize_namespace(os.environ.get("VMTOOL_NAMESPACE", DEFAULT_NAMESPACE))
@@ -1060,6 +1138,28 @@ async def send_html_response(send, status: int, html: str) -> None:
     })
 
 
+async def read_request_body(receive) -> bytes:
+    """Read the full request body."""
+    body = b""
+    while True:
+        message = await receive()
+        body += message.get("body", b"")
+        if not message.get("more_body", False):
+            break
+    return body
+
+
+def parse_form_data(body: bytes) -> Dict[str, str]:
+    """Parse application/x-www-form-urlencoded body."""
+    params = {}
+    if body:
+        for pair in body.decode("utf-8").split("&"):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                params[urllib.parse.unquote_plus(key)] = urllib.parse.unquote_plus(value)
+    return params
+
+
 async def app(scope, receive, send):
     """Minimal ASGI app with manual routing, session management, and OAuth."""
     if scope["type"] == "lifespan":
@@ -1073,6 +1173,7 @@ async def app(scope, receive, send):
                 active_sessions.clear()
                 oauth_states.clear()
                 oauth_tokens.clear()
+                authorization_codes.clear()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -1082,109 +1183,198 @@ async def app(scope, receive, send):
         query_params = parse_query_string(scope.get("query_string", b""))
 
         # ---------------------------------------------------------------------------
-        # OAuth Endpoints
+        # OAuth 2.1 Authorization Server Endpoints
         # ---------------------------------------------------------------------------
 
-        # OAuth metadata endpoint (RFC 8414 style)
-        if path == "/.well-known/oauth-protected-resource" and method == "GET":
+        # OAuth AS metadata (RFC 8414) - ChatGPT discovers our endpoints here
+        if path == "/.well-known/oauth-authorization-server" and method == "GET":
             metadata = {
-                "resource": OAUTH_REDIRECT_URI.rsplit("/auth/callback", 1)[0],
-                "authorization_servers": [{
-                    "issuer": "https://accounts.google.com",
-                    "authorization_endpoint": OAUTH_AUTHORIZATION_ENDPOINT,
-                    "token_endpoint": OAUTH_TOKEN_ENDPOINT,
-                    "jwks_uri": OAUTH_JWKS_URI,
-                }],
-                "scopes_supported": ["openid", "email", "profile"],
+                "issuer": SERVER_BASE_URL,
+                "authorization_endpoint": f"{SERVER_BASE_URL}/authorize",
+                "token_endpoint": f"{SERVER_BASE_URL}/token",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+                "scopes_supported": ["openid", "email", "profile", "mcp"],
             }
             await send_json_response(send, 200, metadata)
 
-        # OAuth login - initiates the OAuth flow
-        elif path == "/auth/login" and method == "GET":
-            # Clean up expired states
+        # Protected resource metadata - points to our AS
+        elif path == "/.well-known/oauth-protected-resource" and method == "GET":
+            metadata = {
+                "resource": SERVER_BASE_URL,
+                "authorization_servers": [SERVER_BASE_URL],
+                "scopes_supported": ["openid", "email", "profile", "mcp"],
+            }
+            await send_json_response(send, 200, metadata)
+
+        # Authorization endpoint - ChatGPT redirects users here
+        elif path == "/authorize" and method == "GET":
             cleanup_expired_oauth_states()
 
-            # Generate PKCE pair and state
-            code_verifier, code_challenge = generate_pkce_pair()
-            state = secrets.token_urlsafe(32)
+            # Get OAuth parameters from ChatGPT
+            client_id = query_params.get("client_id", "")
+            redirect_uri = urllib.parse.unquote(query_params.get("redirect_uri", ""))
+            response_type = query_params.get("response_type", "")
+            state = query_params.get("state", "")
+            code_challenge = query_params.get("code_challenge", "")
+            code_challenge_method = query_params.get("code_challenge_method", "")
 
-            # Store state with code verifier for callback
-            oauth_states[state] = {
-                "code_verifier": code_verifier,
+            # Validate client
+            client = validate_oauth_client(client_id, redirect_uri=redirect_uri)
+            if not client:
+                await send_error_response(send, 400, "invalid_client", "Unknown client_id or invalid redirect_uri")
+                return
+
+            if response_type != "code":
+                await send_error_response(send, 400, "unsupported_response_type", "Only 'code' is supported")
+                return
+
+            # Generate our own PKCE for Google
+            google_verifier, google_challenge = generate_pkce_pair()
+            internal_state = secrets.token_urlsafe(32)
+
+            # Store the OAuth flow state (linking ChatGPT's request to Google auth)
+            oauth_states[internal_state] = {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "state": state,  # ChatGPT's state
+                "code_challenge": code_challenge,
+                "code_challenge_method": code_challenge_method,
+                "google_verifier": google_verifier,
                 "created_at": time.time(),
             }
 
-            # Redirect to Google OAuth
-            auth_url = create_authorization_url(state, code_challenge)
-            logger.info("OAuth login initiated, redirecting to Google")
-            await send_redirect_response(send, auth_url)
+            # Redirect to Google for authentication
+            google_auth_url = create_google_auth_url(internal_state, google_challenge)
+            logger.info("Authorization request from client %s, redirecting to Google", client_id)
+            await send_redirect_response(send, google_auth_url)
 
-        # OAuth callback - handles the redirect from Google
-        elif path == "/auth/callback" and method == "GET":
+        # Google OAuth callback - after user authenticates with Google
+        elif path == "/oauth/google/callback" and method == "GET":
             code = query_params.get("code")
-            state = query_params.get("state")
+            internal_state = query_params.get("state")
             error = query_params.get("error")
 
             if error:
-                logger.warning("OAuth error from Google: %s", error)
+                logger.warning("Google OAuth error: %s", error)
                 await send_html_response(send, 400, f"""
                     <html><body>
                     <h1>Authentication Failed</h1>
-                    <p>Error: {error}</p>
-                    <p><a href="/auth/login">Try again</a></p>
+                    <p>Google returned an error: {error}</p>
                     </body></html>
                 """)
                 return
 
-            if not code or not state:
-                await send_error_response(send, 400, "Missing code or state parameter")
+            if not code or not internal_state:
+                await send_error_response(send, 400, "invalid_request", "Missing code or state")
                 return
 
-            # Validate state
-            state_info = oauth_states.pop(state, None)
-            if not state_info:
-                logger.warning("Invalid or expired OAuth state")
-                await send_error_response(send, 400, "Invalid or expired state", "Please restart the login flow")
+            # Retrieve the stored OAuth flow state
+            flow_state = oauth_states.pop(internal_state, None)
+            if not flow_state:
+                await send_error_response(send, 400, "invalid_state", "Session expired, please try again")
                 return
 
             try:
-                # Exchange code for token
-                token_response = await exchange_code_for_token(code, state_info["code_verifier"])
-                access_token = token_response.get("access_token")
-                expires_in = token_response.get("expires_in", 3600)
+                # Exchange Google code for token
+                google_tokens = await exchange_google_code(code, flow_state["google_verifier"])
+                google_access_token = google_tokens.get("access_token")
 
-                # Get user info
-                user_info = await get_user_info(access_token)
+                # Get user info from Google
+                user_info = await get_google_user_info(google_access_token)
+                logger.info("Google auth successful for: %s", user_info.get("email"))
 
-                # Store token with user info
-                oauth_tokens[access_token] = {
-                    "user_id": user_info.get("id"),
-                    "email": user_info.get("email"),
-                    "name": user_info.get("name"),
-                    "expires_at": time.time() + expires_in,
-                    "created_at": time.time(),
-                }
+                # Create our authorization code for ChatGPT
+                auth_code = create_authorization_code(
+                    client_id=flow_state["client_id"],
+                    redirect_uri=flow_state["redirect_uri"],
+                    user_info=user_info,
+                    code_challenge=flow_state.get("code_challenge"),
+                    code_challenge_method=flow_state.get("code_challenge_method"),
+                )
 
-                logger.info("OAuth login successful for user: %s", user_info.get("email"))
+                # Redirect back to ChatGPT with authorization code
+                redirect_params = {"code": auth_code}
+                if flow_state.get("state"):
+                    redirect_params["state"] = flow_state["state"]
 
-                # Return success page with token
-                await send_html_response(send, 200, f"""
+                redirect_url = f"{flow_state['redirect_uri']}?{urllib.parse.urlencode(redirect_params)}"
+                logger.info("Redirecting to client with authorization code")
+                await send_redirect_response(send, redirect_url)
+
+            except Exception as e:
+                logger.error("Google token exchange failed: %s", str(e))
+                await send_html_response(send, 500, f"""
                     <html><body>
-                    <h1>Authentication Successful</h1>
-                    <p>Welcome, {user_info.get("name", user_info.get("email"))}!</p>
-                    <h2>Your Access Token</h2>
-                    <p>Use this token in the Authorization header:</p>
-                    <pre style="background:#f0f0f0;padding:10px;word-break:break-all;">Bearer {access_token}</pre>
-                    <h2>Connect to MCP</h2>
-                    <p>MCP endpoint: <code>/mcp</code></p>
-                    <p>Include the Authorization header with your requests.</p>
-                    <p><strong>Note:</strong> Token expires in {expires_in // 60} minutes.</p>
+                    <h1>Authentication Failed</h1>
+                    <p>Error: {str(e)}</p>
                     </body></html>
                 """)
 
-            except Exception as e:
-                logger.error("OAuth token exchange failed: %s", str(e))
-                await send_error_response(send, 500, "Token exchange failed", str(e))
+        # Token endpoint - ChatGPT exchanges authorization code for access token
+        elif path == "/token" and method == "POST":
+            body = await read_request_body(receive)
+            form_data = parse_form_data(body)
+
+            grant_type = form_data.get("grant_type")
+            code = form_data.get("code")
+            redirect_uri = form_data.get("redirect_uri")
+            client_id = form_data.get("client_id")
+            client_secret = form_data.get("client_secret")
+            code_verifier = form_data.get("code_verifier")
+
+            # Also check Basic auth header for client credentials
+            if not client_id or not client_secret:
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode()
+                if auth_header.startswith("Basic "):
+                    try:
+                        decoded = base64.b64decode(auth_header[6:]).decode()
+                        client_id, client_secret = decoded.split(":", 1)
+                    except Exception:
+                        pass
+
+            if grant_type != "authorization_code":
+                await send_json_response(send, 400, {"error": "unsupported_grant_type"})
+                return
+
+            # Validate client
+            client = validate_oauth_client(client_id, client_secret)
+            if not client:
+                await send_json_response(send, 401, {"error": "invalid_client"})
+                return
+
+            # Validate authorization code
+            code_info = authorization_codes.pop(code, None)
+            if not code_info:
+                await send_json_response(send, 400, {"error": "invalid_grant", "error_description": "Invalid or expired code"})
+                return
+
+            # Verify code was issued to this client
+            if code_info["client_id"] != client_id:
+                await send_json_response(send, 400, {"error": "invalid_grant", "error_description": "Code was not issued to this client"})
+                return
+
+            # Verify PKCE if code_challenge was provided during authorization
+            if code_info.get("code_challenge"):
+                if not code_verifier:
+                    await send_json_response(send, 400, {"error": "invalid_request", "error_description": "code_verifier required"})
+                    return
+                if not verify_pkce_challenge(code_verifier, code_info["code_challenge"]):
+                    await send_json_response(send, 400, {"error": "invalid_grant", "error_description": "PKCE verification failed"})
+                    return
+
+            # Create access token
+            access_token, expires_in = create_access_token(code_info["user_info"], client_id)
+            logger.info("Token issued for user %s to client %s", code_info["user_info"].get("email"), client_id)
+
+            await send_json_response(send, 200, {
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": expires_in,
+            })
 
         # Token info endpoint - check token validity
         elif path == "/auth/token" and method == "GET":
@@ -1347,8 +1537,8 @@ async def app(scope, receive, send):
                 404,
                 "Endpoint not found",
                 f"Path '{path}' does not exist. Available endpoints: "
-                "/auth/login (GET), /auth/callback (GET), /auth/token (GET), "
-                "/mcp (GET), /messages (POST), /health (GET), /ping (GET), /session (GET)"
+                "/authorize (GET), /token (POST), /mcp (GET), /messages (POST), "
+                "/health (GET), /ping (GET), /session (GET)"
             )
 
 if __name__ == "__main__":
