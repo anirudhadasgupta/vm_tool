@@ -15,11 +15,15 @@ import io
 import time
 import uuid
 import json
+import secrets
+import hashlib
+import urllib.parse
 from typing import Any, List, Dict, Optional
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
 
+import httpx
 from mcp.server.sse import SseServerTransport
 from mcp.server import Server
 from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -47,6 +51,32 @@ WORKSPACE.mkdir(parents=True, exist_ok=True)
 MAX_OUTPUT = 500_000  # 500KB
 DEFAULT_TIMEOUT = 3600
 EXCLUDED_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
+
+# ---------------------------------------------------------------------------
+# OAuth Configuration (Google)
+# ---------------------------------------------------------------------------
+
+OAUTH_CLIENT_ID = os.environ.get(
+    "OAUTH_CLIENT_ID",
+    "81258210604-2ie1n8a29a9sgcl0gmpj8agvjn5nja3h.apps.googleusercontent.com"
+)
+OAUTH_CLIENT_SECRET = os.environ.get(
+    "OAUTH_CLIENT_SECRET",
+    "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"
+)
+OAUTH_REDIRECT_URI = os.environ.get(
+    "OAUTH_REDIRECT_URI",
+    "https://vm-tool-81258210604.us-central1.run.app/auth/callback"
+)
+OAUTH_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/auth"
+OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+OAUTH_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
+OAUTH_JWKS_URI = "https://www.googleapis.com/oauth2/v3/certs"
+
+# OAuth state storage (in production, use Redis or similar)
+oauth_states: Dict[str, Dict[str, Any]] = {}
+# Token storage keyed by access token
+oauth_tokens: Dict[str, Dict[str, Any]] = {}
 
 repo_index_cache: dict[str, Any] = {
     "root": None,
@@ -113,6 +143,99 @@ def cleanup_stale_sessions() -> int:
 def get_session_info(session_id: str) -> Optional[Dict[str, Any]]:
     """Get session info if it exists."""
     return active_sessions.get(session_id)
+
+
+# ---------------------------------------------------------------------------
+# OAuth Helper Functions
+# ---------------------------------------------------------------------------
+
+def generate_pkce_pair() -> tuple[str, str]:
+    """Generate PKCE code verifier and challenge."""
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).decode().rstrip("=")
+    return code_verifier, code_challenge
+
+
+def create_authorization_url(state: str, code_challenge: str) -> str:
+    """Create Google OAuth authorization URL."""
+    params = {
+        "client_id": OAUTH_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    return f"{OAUTH_AUTHORIZATION_ENDPOINT}?{urllib.parse.urlencode(params)}"
+
+
+async def exchange_code_for_token(code: str, code_verifier: str) -> Dict[str, Any]:
+    """Exchange authorization code for access token."""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            OAUTH_TOKEN_ENDPOINT,
+            data={
+                "client_id": OAUTH_CLIENT_ID,
+                "client_secret": OAUTH_CLIENT_SECRET,
+                "code": code,
+                "code_verifier": code_verifier,
+                "grant_type": "authorization_code",
+                "redirect_uri": OAUTH_REDIRECT_URI,
+            },
+        )
+        if response.status_code != 200:
+            raise ValueError(f"Token exchange failed: {response.text}")
+        return response.json()
+
+
+async def get_user_info(access_token: str) -> Dict[str, Any]:
+    """Get user info from Google."""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            OAUTH_USERINFO_ENDPOINT,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if response.status_code != 200:
+            raise ValueError(f"Failed to get user info: {response.text}")
+        return response.json()
+
+
+def validate_token(token: str) -> Optional[Dict[str, Any]]:
+    """Validate an access token and return token info if valid."""
+    token_info = oauth_tokens.get(token)
+    if not token_info:
+        return None
+    # Check expiration
+    if token_info.get("expires_at", 0) < time.time():
+        oauth_tokens.pop(token, None)
+        return None
+    return token_info
+
+
+def extract_bearer_token(scope: dict) -> Optional[str]:
+    """Extract Bearer token from request headers."""
+    headers = dict(scope.get("headers", []))
+    auth_header = headers.get(b"authorization", b"").decode()
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:]
+    return None
+
+
+def cleanup_expired_oauth_states() -> int:
+    """Remove expired OAuth states. Returns count removed."""
+    now = time.time()
+    expired = [
+        state for state, info in oauth_states.items()
+        if now - info.get("created_at", 0) > 600  # 10 minute expiry
+    ]
+    for state in expired:
+        oauth_states.pop(state, None)
+    return len(expired)
 
 
 suggested_namespace = sanitize_namespace(os.environ.get("VMTOOL_NAMESPACE", DEFAULT_NAMESPACE))
@@ -877,21 +1000,79 @@ async def send_error_response(send, status: int, error: str, details: str = None
         data["details"] = details
     if status == 404 and "session" in error.lower():
         data["action"] = "reconnect"
-        data["hint"] = "The SSE connection has expired. Please establish a new connection to /sse"
+        data["hint"] = "The SSE connection has expired. Please establish a new connection to /mcp"
     await send_json_response(send, status, data)
 
 
+async def send_unauthorized_response(send, error: str = "unauthorized") -> None:
+    """Send a 401 Unauthorized response with WWW-Authenticate header."""
+    body = json.dumps({
+        "error": error,
+        "status": 401,
+        "auth_url": "/auth/login",
+        "hint": "Obtain an access token via OAuth at /auth/login",
+    }).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": 401,
+        "headers": [
+            [b"content-type", b"application/json"],
+            [b"www-authenticate", b'Bearer realm="mcp-server"'],
+            [b"access-control-allow-origin", b"*"],
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": body,
+    })
+
+
+async def send_redirect_response(send, location: str) -> None:
+    """Send a redirect response."""
+    await send({
+        "type": "http.response.start",
+        "status": 302,
+        "headers": [
+            [b"location", location.encode()],
+            [b"access-control-allow-origin", b"*"],
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": b"",
+    })
+
+
+async def send_html_response(send, status: int, html: str) -> None:
+    """Send an HTML response."""
+    body = html.encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            [b"content-type", b"text/html; charset=utf-8"],
+            [b"access-control-allow-origin", b"*"],
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": body,
+    })
+
+
 async def app(scope, receive, send):
-    """Minimal ASGI app with manual routing and session management."""
+    """Minimal ASGI app with manual routing, session management, and OAuth."""
     if scope["type"] == "lifespan":
         while True:
             message = await receive()
             if message["type"] == "lifespan.startup":
-                logger.info("MCP Shell Server starting")
+                logger.info("MCP Shell Server starting (OAuth enabled)")
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":
                 logger.info("MCP Shell Server stopping - cleaning up %d sessions", len(active_sessions))
                 active_sessions.clear()
+                oauth_states.clear()
+                oauth_tokens.clear()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
 
@@ -900,42 +1081,195 @@ async def app(scope, receive, send):
         method = scope["method"]
         query_params = parse_query_string(scope.get("query_string", b""))
 
-        # SSE connection endpoint - main entry point for MCP clients
-        if path == "/sse" and method == "GET":
+        # ---------------------------------------------------------------------------
+        # OAuth Endpoints
+        # ---------------------------------------------------------------------------
+
+        # OAuth metadata endpoint (RFC 8414 style)
+        if path == "/.well-known/oauth-protected-resource" and method == "GET":
+            metadata = {
+                "resource": OAUTH_REDIRECT_URI.rsplit("/auth/callback", 1)[0],
+                "authorization_servers": [{
+                    "issuer": "https://accounts.google.com",
+                    "authorization_endpoint": OAUTH_AUTHORIZATION_ENDPOINT,
+                    "token_endpoint": OAUTH_TOKEN_ENDPOINT,
+                    "jwks_uri": OAUTH_JWKS_URI,
+                }],
+                "scopes_supported": ["openid", "email", "profile"],
+            }
+            await send_json_response(send, 200, metadata)
+
+        # OAuth login - initiates the OAuth flow
+        elif path == "/auth/login" and method == "GET":
+            # Clean up expired states
+            cleanup_expired_oauth_states()
+
+            # Generate PKCE pair and state
+            code_verifier, code_challenge = generate_pkce_pair()
+            state = secrets.token_urlsafe(32)
+
+            # Store state with code verifier for callback
+            oauth_states[state] = {
+                "code_verifier": code_verifier,
+                "created_at": time.time(),
+            }
+
+            # Redirect to Google OAuth
+            auth_url = create_authorization_url(state, code_challenge)
+            logger.info("OAuth login initiated, redirecting to Google")
+            await send_redirect_response(send, auth_url)
+
+        # OAuth callback - handles the redirect from Google
+        elif path == "/auth/callback" and method == "GET":
+            code = query_params.get("code")
+            state = query_params.get("state")
+            error = query_params.get("error")
+
+            if error:
+                logger.warning("OAuth error from Google: %s", error)
+                await send_html_response(send, 400, f"""
+                    <html><body>
+                    <h1>Authentication Failed</h1>
+                    <p>Error: {error}</p>
+                    <p><a href="/auth/login">Try again</a></p>
+                    </body></html>
+                """)
+                return
+
+            if not code or not state:
+                await send_error_response(send, 400, "Missing code or state parameter")
+                return
+
+            # Validate state
+            state_info = oauth_states.pop(state, None)
+            if not state_info:
+                logger.warning("Invalid or expired OAuth state")
+                await send_error_response(send, 400, "Invalid or expired state", "Please restart the login flow")
+                return
+
+            try:
+                # Exchange code for token
+                token_response = await exchange_code_for_token(code, state_info["code_verifier"])
+                access_token = token_response.get("access_token")
+                expires_in = token_response.get("expires_in", 3600)
+
+                # Get user info
+                user_info = await get_user_info(access_token)
+
+                # Store token with user info
+                oauth_tokens[access_token] = {
+                    "user_id": user_info.get("id"),
+                    "email": user_info.get("email"),
+                    "name": user_info.get("name"),
+                    "expires_at": time.time() + expires_in,
+                    "created_at": time.time(),
+                }
+
+                logger.info("OAuth login successful for user: %s", user_info.get("email"))
+
+                # Return success page with token
+                await send_html_response(send, 200, f"""
+                    <html><body>
+                    <h1>Authentication Successful</h1>
+                    <p>Welcome, {user_info.get("name", user_info.get("email"))}!</p>
+                    <h2>Your Access Token</h2>
+                    <p>Use this token in the Authorization header:</p>
+                    <pre style="background:#f0f0f0;padding:10px;word-break:break-all;">Bearer {access_token}</pre>
+                    <h2>Connect to MCP</h2>
+                    <p>MCP endpoint: <code>/mcp</code></p>
+                    <p>Include the Authorization header with your requests.</p>
+                    <p><strong>Note:</strong> Token expires in {expires_in // 60} minutes.</p>
+                    </body></html>
+                """)
+
+            except Exception as e:
+                logger.error("OAuth token exchange failed: %s", str(e))
+                await send_error_response(send, 500, "Token exchange failed", str(e))
+
+        # Token info endpoint - check token validity
+        elif path == "/auth/token" and method == "GET":
+            token = extract_bearer_token(scope)
+            if not token:
+                await send_unauthorized_response(send, "No token provided")
+                return
+
+            token_info = validate_token(token)
+            if not token_info:
+                await send_unauthorized_response(send, "Invalid or expired token")
+                return
+
+            await send_json_response(send, 200, {
+                "valid": True,
+                "email": token_info.get("email"),
+                "name": token_info.get("name"),
+                "expires_in": int(token_info.get("expires_at", 0) - time.time()),
+            })
+
+        # ---------------------------------------------------------------------------
+        # MCP Endpoints (OAuth Protected)
+        # ---------------------------------------------------------------------------
+
+        # MCP SSE connection endpoint - main entry point for MCP clients
+        elif path == "/mcp" and method == "GET":
+            # Validate OAuth token
+            token = extract_bearer_token(scope)
+            if not token:
+                logger.warning("MCP connection attempt without token")
+                await send_unauthorized_response(send, "Authentication required")
+                return
+
+            token_info = validate_token(token)
+            if not token_info:
+                logger.warning("MCP connection attempt with invalid token")
+                await send_unauthorized_response(send, "Invalid or expired token")
+                return
+
             # Generate a session ID for tracking
             session_id = str(uuid.uuid4())
             register_session(session_id)
+            # Store user info in session
+            active_sessions[session_id]["user"] = token_info.get("email")
 
             try:
                 # Clean up stale sessions periodically
                 cleanup_stale_sessions()
 
+                logger.info("MCP connection established for user: %s (session: %s)",
+                           token_info.get("email"), session_id[:8])
+
                 async with sse.connect_sse(scope, receive, send) as streams:
-                    logger.info("SSE connection established: %s", session_id[:8])
                     await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
             except Exception as e:
-                logger.error("SSE connection error for session %s: %s", session_id[:8], str(e))
+                logger.error("MCP connection error for session %s: %s", session_id[:8], str(e))
             finally:
                 unregister_session(session_id)
 
         # Message relay endpoint - receives POST messages for SSE streams
         elif path == "/messages" and method == "POST":
+            # Validate OAuth token
+            token = extract_bearer_token(scope)
+            if not token:
+                await send_unauthorized_response(send, "Authentication required")
+                return
+
+            token_info = validate_token(token)
+            if not token_info:
+                await send_unauthorized_response(send, "Invalid or expired token")
+                return
+
             try:
-                # Try to handle the message
                 await sse.handle_post_message(scope, receive, send)
             except Exception as e:
                 error_msg = str(e)
                 logger.warning("Message handling error: %s", error_msg)
 
-                # Check if this is a session-related error
                 if "not found" in error_msg.lower() or "session" in error_msg.lower():
                     await send_error_response(
                         send,
                         404,
                         "Session not found",
-                        "The SSE session has expired or was never established. "
-                        "This typically happens after long idle periods or network disconnections. "
-                        "Please reconnect by establishing a new SSE connection to /sse"
+                        "The MCP session has expired or was never established. "
+                        "Please reconnect by establishing a new connection to /mcp"
                     )
                 else:
                     await send_error_response(
@@ -945,9 +1279,12 @@ async def app(scope, receive, send):
                         error_msg
                     )
 
+        # ---------------------------------------------------------------------------
+        # Public Endpoints
+        # ---------------------------------------------------------------------------
+
         # Health check endpoint - enhanced with session info
         elif path == "/health" and method == "GET":
-            # Clean up stale sessions on health check
             stale_count = cleanup_stale_sessions()
 
             health_data = {
@@ -956,6 +1293,7 @@ async def app(scope, receive, send):
                 "namespace": suggested_namespace,
                 "active_sessions": len(active_sessions),
                 "stale_sessions_cleaned": stale_count,
+                "oauth_enabled": True,
             }
             await send_json_response(send, 200, health_data)
 
@@ -976,6 +1314,7 @@ async def app(scope, receive, send):
                     await send_json_response(send, 200, {
                         "valid": True,
                         "session_id": session_id[:8] + "...",
+                        "user": session_info.get("user"),
                         "age_seconds": time.time() - session_info["created_at"],
                         "last_activity_seconds_ago": time.time() - session_info["last_activity"],
                         "message_count": session_info["message_count"],
@@ -988,10 +1327,10 @@ async def app(scope, receive, send):
                         f"Session {session_id[:8]}... does not exist or has expired"
                     )
             else:
-                # Return list of active sessions (for debugging)
                 sessions = [
                     {
                         "id": sid[:8] + "...",
+                        "user": info.get("user"),
                         "age_seconds": time.time() - info["created_at"],
                         "messages": info["message_count"],
                     }
@@ -999,7 +1338,7 @@ async def app(scope, receive, send):
                 ]
                 await send_json_response(send, 200, {
                     "active_sessions": len(sessions),
-                    "sessions": sessions[:10],  # Limit to first 10
+                    "sessions": sessions[:10],
                 })
 
         else:
@@ -1007,7 +1346,9 @@ async def app(scope, receive, send):
                 send,
                 404,
                 "Endpoint not found",
-                f"Path '{path}' does not exist. Available endpoints: /sse (GET), /messages (POST), /health (GET), /ping (GET), /session (GET)"
+                f"Path '{path}' does not exist. Available endpoints: "
+                "/auth/login (GET), /auth/callback (GET), /auth/token (GET), "
+                "/mcp (GET), /messages (POST), /health (GET), /ping (GET), /session (GET)"
             )
 
 if __name__ == "__main__":
