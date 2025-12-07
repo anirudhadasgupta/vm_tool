@@ -39,7 +39,10 @@ def sanitize_namespace(name: str) -> str:
     return cleaned or DEFAULT_NAMESPACE
 
 
-WORKSPACE = Path("/app/workspace").resolve()
+# Workspace path - configurable for different environments
+# Cloud Run: /app/workspace
+# Replit: /home/runner/workspace
+WORKSPACE = Path(os.environ.get("WORKSPACE", "/app/workspace")).resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 MAX_OUTPUT = 500_000  # 500KB
@@ -755,13 +758,17 @@ async def app(scope, receive, send):
 
             try:
                 cleanup_stale_sessions()
+                logger.info("MCP connection starting: %s", session_id[:8])
                 async with sse.connect_sse(scope, receive, send) as streams:
                     logger.info("MCP connection established: %s", session_id[:8])
                     await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+            except asyncio.CancelledError:
+                logger.info("MCP connection cancelled: %s", session_id[:8])
             except Exception as e:
-                logger.error("MCP connection error: %s", str(e))
+                logger.error("MCP connection error for %s: %s", session_id[:8], str(e))
             finally:
                 unregister_session(session_id)
+                logger.info("MCP connection closed: %s", session_id[:8])
 
         # Message relay for SSE
         elif path == "/messages" and method == "POST":
@@ -771,7 +778,12 @@ async def app(scope, receive, send):
                 error_msg = str(e)
                 logger.warning("Message error: %s", error_msg)
                 if "not found" in error_msg.lower():
-                    await send_error_response(send, 404, "Session not found")
+                    await send_json_response(send, 404, {
+                        "error": "session_expired",
+                        "message": "The MCP session has expired or was disconnected. Please reconnect to /sse",
+                        "action": "reconnect",
+                        "reconnect_url": "/sse"
+                    })
                 else:
                     await send_error_response(send, 500, "Message handling failed", error_msg)
 

@@ -1,0 +1,19 @@
+run = "sh -c 'if [ -n \"$GH_TOKEN\" ]; then echo \"$GH_TOKEN\" | gh auth login --with-token 2>/dev/null || true; fi && python server.py'"
+language = "python3"
+entrypoint = "server.py"
+
+[env]
+PYTHONUNBUFFERED = "1"
+PORT = "8080"
+WORKSPACE = "/home/runner/workspace"
+
+[nix]
+channel = "stable-23_11"
+
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+[deployment]
+run = "python server.py"
+deploymentTarget = "cloudrun"
