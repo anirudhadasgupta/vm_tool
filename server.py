@@ -1192,6 +1192,7 @@ async def app(scope, receive, send):
                 "issuer": SERVER_BASE_URL,
                 "authorization_endpoint": f"{SERVER_BASE_URL}/authorize",
                 "token_endpoint": f"{SERVER_BASE_URL}/token",
+                "registration_endpoint": f"{SERVER_BASE_URL}/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code"],
                 "code_challenge_methods_supported": ["S256"],
@@ -1376,6 +1377,44 @@ async def app(scope, receive, send):
                 "expires_in": expires_in,
             })
 
+        # Dynamic Client Registration (RFC 7591) - ChatGPT registers itself here
+        elif path == "/register" and method == "POST":
+            body = await read_request_body(receive)
+            try:
+                client_metadata = json.loads(body.decode("utf-8")) if body else {}
+            except json.JSONDecodeError:
+                await send_json_response(send, 400, {"error": "invalid_request", "error_description": "Invalid JSON"})
+                return
+
+            # Generate a unique client_id and secret for this registration
+            new_client_id = f"dyn-{secrets.token_urlsafe(16)}"
+            new_client_secret = secrets.token_urlsafe(32)
+
+            # Extract redirect_uris from the request (required by RFC 7591)
+            redirect_uris = client_metadata.get("redirect_uris", ["*"])
+            client_name = client_metadata.get("client_name", "Dynamic Client")
+
+            # Register the new client
+            oauth_clients[new_client_id] = {
+                "client_secret": new_client_secret,
+                "redirect_uris": redirect_uris if redirect_uris else ["*"],
+                "name": client_name,
+                "created_at": time.time(),
+            }
+
+            logger.info("Dynamic client registered: %s (%s)", new_client_id, client_name)
+
+            # Return the client credentials (RFC 7591 response)
+            await send_json_response(send, 201, {
+                "client_id": new_client_id,
+                "client_secret": new_client_secret,
+                "client_id_issued_at": int(time.time()),
+                "client_secret_expires_at": 0,  # Never expires
+                "redirect_uris": redirect_uris,
+                "client_name": client_name,
+                "token_endpoint_auth_method": "client_secret_post",
+            })
+
         # Token info endpoint - check token validity
         elif path == "/auth/token" and method == "GET":
             token = extract_bearer_token(scope)
@@ -1537,8 +1576,8 @@ async def app(scope, receive, send):
                 404,
                 "Endpoint not found",
                 f"Path '{path}' does not exist. Available endpoints: "
-                "/authorize (GET), /token (POST), /mcp (GET), /messages (POST), "
-                "/health (GET), /ping (GET), /session (GET)"
+                "/authorize (GET), /token (POST), /register (POST), /mcp (GET), "
+                "/messages (POST), /health (GET), /ping (GET), /session (GET)"
             )
 
 if __name__ == "__main__":
