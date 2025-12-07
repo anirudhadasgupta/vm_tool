@@ -2,7 +2,8 @@
 MCP Server - Minimal Shell-First Design
 
 Philosophy: One primary tool (shell), minimal overhead.
-ChatGPT should just run commands like it's in a terminal.
+ChatGPT should just run commands like it's in a terminal. Keep the link alive by
+leaning on the tools instead of ad-hoc text.
 """
 
 import os
@@ -122,6 +123,7 @@ ENV_INFO = """
 
 ## ⚠️ EPHEMERAL SESSION
 This environment resets between chat sessions. Clone repos fresh each time.
+If the link feels stale, call the **help** tool again to refresh context.
 
 ## Environment Details
 - Timeout: 3600
@@ -137,7 +139,7 @@ This environment resets between chat sessions. Clone repos fresh each time.
 
 ## Available Tools (use gh for GitHub!)
 
-### GitHub CLI (gh) - PREFERRED for GitHub operations
+### GitHub CLI (gh) — the GitHub hook
 ```
 gh repo clone owner/repo              # clone repo
 gh repo clone owner/repo -- --depth 1 # shallow clone
@@ -214,16 +216,16 @@ git push origin feature
 REPO_TOOLS_INFO = """
 # Repo Utilities
 
-## repo_map
+## repo_map — "Where am I?"
 - Quickly map directory structure. Defaults to the workspace root, depth 3, and 400 entries to avoid noise.
 
-## read_module
+## read_module — "Show me the code"
 - Read a Python module using dotted notation (e.g., `pkg.module.submodule`). Falls back to `__init__.py` when given a package.
 
-## index_repo
+## index_repo — "Prime the cache"
 - Build (or refresh) a lightweight in-memory index of workspace files. Skips common large folders such as `.git` and `node_modules`.
 
-## search_repo
+## search_repo — "Targeted search"
 - Ripgrep-powered search with context lines and glob filters. Respects the cached index metadata for quick reporting.
 """
 
@@ -415,7 +417,7 @@ cat file.py | head -100            # view file
 TOOLS = [
     types.Tool(
         name="help",
-        description="Show environment info, available commands, and usage examples. Call this first to understand what's available.",
+        description="Show environment info, available commands, and usage examples. Call this first to sync context and keep ChatGPT grounded.",
         inputSchema={
             "type": "object",
             "properties": {},
@@ -423,13 +425,13 @@ TOOLS = [
     ),
     types.Tool(
         name="sh",
-        description=f"""Run any shell command. Primary tool for everything.
+        description=f"""Run any shell command. Primary tool for everything—use this as your default action hook.
 
 Available: gh (GitHub CLI), git, rg (ripgrep), fd, python, node, gcloud, curl, jq
 
 IMPORTANT: Use 'gh' for GitHub operations, not 'git clone':
 {SHELL_EXAMPLES}
-Call 'help' tool for full documentation.""",
+If the session feels idle, issue a lightweight command (e.g., `pwd`) to keep the pipe warm.""",
         inputSchema={
             "type": "object",
             "properties": {
@@ -441,7 +443,7 @@ Call 'help' tool for full documentation.""",
     ),
     types.Tool(
         name="write",
-        description="Write content to a file.",
+        description="Write content to a file. Use after edits to avoid drifting state in the chat window.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -453,7 +455,7 @@ Call 'help' tool for full documentation.""",
     ),
     types.Tool(
         name="read",
-        description="Read a file with syntax highlighting.",
+        description="Read a file with syntax highlighting. Great for quick context refreshes mid-session.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -478,7 +480,7 @@ For directory: creates zip and returns base64""",
     ),
     types.Tool(
         name="repo_map",
-        description="Summarize repository structure with depth and entry limits to avoid overload.",
+        description="Summarize repository structure with depth and entry limits to avoid overload. First stop after cloning to orient yourself.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -490,7 +492,7 @@ For directory: creates zip and returns base64""",
     ),
     types.Tool(
         name="read_module",
-        description="Read a Python module via dotted path (e.g., package.module). Falls back to __init__.py for packages.",
+        description="Read a Python module via dotted path (e.g., package.module). Fast hook when you know the import path.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -503,7 +505,7 @@ For directory: creates zip and returns base64""",
     ),
     types.Tool(
         name="index_repo",
-        description="Build a cached index of repository files for faster subsequent search and summaries.",
+        description="Build a cached index of repository files for faster subsequent search and summaries. Run once per repo to keep searches snappy.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -515,7 +517,7 @@ For directory: creates zip and returns base64""",
     ),
     types.Tool(
         name="search_repo",
-        description="Ripgrep-powered search with context lines and optional glob filters.",
+        description="Ripgrep-powered search with context lines and optional glob filters. Use after index_repo for best speed.",
         inputSchema={
             "type": "object",
             "properties": {
