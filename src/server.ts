@@ -14,6 +14,7 @@ const DEFAULT_NAMESPACE = "vmtool";
 const DEFAULT_TIMEOUT = 3600; // seconds
 const MAX_OUTPUT = 500_000; // bytes
 const SESSION_TIMEOUT = 3600; // seconds
+const BASE_PATH = "/mcp";
 const EXCLUDED_DIRS = new Set([
   ".git",
   ".hg",
@@ -180,13 +181,13 @@ function buildEnvInfo(): string {
     "## Server namespace & tool paths",
     `- Namespace: \`${namespace}\` (set VMTOOL_NAMESPACE to override)`,
     "- Canonical tool paths:",
-    "- /tool/help",
-    "- /tool/sh",
-    "- /tool/write",
-    "- /tool/read",
-    "- /tool/export",
-    "- /tool/repo_map",
-    "- /tool/search_repo",
+    `- ${BASE_PATH}/tool/help`,
+    `- ${BASE_PATH}/tool/sh`,
+    `- ${BASE_PATH}/tool/write`,
+    `- ${BASE_PATH}/tool/read`,
+    `- ${BASE_PATH}/tool/export`,
+    `- ${BASE_PATH}/tool/repo_map`,
+    `- ${BASE_PATH}/tool/search_repo`,
     "",
     "## Environment Details",
     "- Timeout: 3600",
@@ -345,7 +346,7 @@ function cleanupStaleSessions() {
   }
 }
 
-app.get("/sse", (req, res) => {
+app.get(`${BASE_PATH}/sse`, (req, res) => {
   const session = registerSession(res);
 
   res.writeHead(200, {
@@ -363,15 +364,15 @@ app.get("/sse", (req, res) => {
   });
 });
 
-app.post("/messages", (req, res) => {
+app.post(`${BASE_PATH}/messages`, (req, res) => {
   const { sessionId, event = "message", data } = req.body || {};
   const session = sessionId ? sessions.get(sessionId) : undefined;
   if (!session) {
     return res.status(404).json({
       error: "session_expired",
-      message: "The MCP session has expired or was disconnected. Please reconnect to /sse",
+      message: `The MCP session has expired or was disconnected. Please reconnect to ${BASE_PATH}/sse`,
       action: "reconnect",
-      reconnect_url: "/sse",
+      reconnect_url: `${BASE_PATH}/sse`,
     });
   }
   updateSession(session);
@@ -379,11 +380,11 @@ app.post("/messages", (req, res) => {
   return res.json({ status: "sent" });
 });
 
-app.get("/tools", (_req, res) => {
+app.get(`${BASE_PATH}/tools`, (_req, res) => {
   return res.json({ tools: TOOLS });
 });
 
-app.post("/tool/:name", async (req, res) => {
+app.post(`${BASE_PATH}/tool/:name`, async (req, res) => {
   const { name } = req.params;
   try {
     cleanupStaleSessions();
@@ -435,11 +436,11 @@ app.post("/tool/:name", async (req, res) => {
   }
 });
 
-app.get("/health", (_req, res) => {
+app.get(`${BASE_PATH}/health`, (_req, res) => {
   res.json({ status: "ok", tools: TOOLS.length, namespace, active_sessions: sessions.size });
 });
 
-app.get("/ping", (_req, res) => {
+app.get(`${BASE_PATH}/ping`, (_req, res) => {
   res.json({ status: "pong", namespace });
 });
 
