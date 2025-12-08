@@ -31,6 +31,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-server")
 
 DEFAULT_NAMESPACE = "vmtool"
+BASE_PATH = "/mcp"
+SSE_PATH = f"{BASE_PATH}/sse"
+MESSAGES_PATH = f"{BASE_PATH}/messages"
+HEALTH_PATH = f"{BASE_PATH}/health"
+PING_PATH = f"{BASE_PATH}/ping"
+SESSION_PATH = f"{BASE_PATH}/session"
 
 
 def sanitize_namespace(name: str) -> str:
@@ -114,7 +120,7 @@ def get_session_info(session_id: str) -> Optional[Dict[str, Any]]:
 
 suggested_namespace = sanitize_namespace(os.environ.get("VMTOOL_NAMESPACE", DEFAULT_NAMESPACE))
 mcp = Server(suggested_namespace)
-sse = SseServerTransport("/messages")
+sse = SseServerTransport(MESSAGES_PATH)
 
 logger.info("vmtool namespace: %s", suggested_namespace)
 
@@ -728,7 +734,7 @@ async def send_error_response(send, status: int, error: str, details: str = None
         data["details"] = details
     if status == 404 and "session" in error.lower():
         data["action"] = "reconnect"
-        data["hint"] = "Please establish a new connection to /sse"
+        data["hint"] = f"Please establish a new connection to {SSE_PATH}"
     await send_json_response(send, status, data)
 
 
@@ -752,7 +758,7 @@ async def app(scope, receive, send):
         query_params = parse_query_string(scope.get("query_string", b""))
 
         # SSE connection - main MCP endpoint
-        if path == "/sse" and method == "GET":
+        if path == SSE_PATH and method == "GET":
             session_id = str(uuid.uuid4())
             register_session(session_id)
 
@@ -771,7 +777,7 @@ async def app(scope, receive, send):
                 logger.info("MCP connection closed: %s", session_id[:8])
 
         # Message relay for SSE
-        elif path == "/messages" and method == "POST":
+        elif path == MESSAGES_PATH and method == "POST":
             try:
                 await sse.handle_post_message(scope, receive, send)
             except Exception as e:
@@ -780,15 +786,15 @@ async def app(scope, receive, send):
                 if "not found" in error_msg.lower():
                     await send_json_response(send, 404, {
                         "error": "session_expired",
-                        "message": "The MCP session has expired or was disconnected. Please reconnect to /sse",
+                        "message": f"The MCP session has expired or was disconnected. Please reconnect to {SSE_PATH}",
                         "action": "reconnect",
-                        "reconnect_url": "/sse"
+                        "reconnect_url": SSE_PATH
                     })
                 else:
                     await send_error_response(send, 500, "Message handling failed", error_msg)
 
         # Health check
-        elif path == "/health" and method == "GET":
+        elif path == HEALTH_PATH and method == "GET":
             await send_json_response(send, 200, {
                 "status": "ok",
                 "tools": len(TOOLS),
@@ -797,11 +803,11 @@ async def app(scope, receive, send):
             })
 
         # Ping
-        elif path == "/ping" and method == "GET":
+        elif path == PING_PATH and method == "GET":
             await send_json_response(send, 200, {"pong": True, "timestamp": time.time()})
 
         # Session info
-        elif path == "/session" and method == "GET":
+        elif path == SESSION_PATH and method == "GET":
             session_id = query_params.get("id", "")
             if session_id:
                 info = get_session_info(session_id)
@@ -820,7 +826,7 @@ async def app(scope, receive, send):
 
         else:
             await send_error_response(send, 404, "Not found",
-                f"Available: /sse (GET), /messages (POST), /health (GET), /ping (GET)")
+                f"Available: {SSE_PATH} (GET), {MESSAGES_PATH} (POST), {HEALTH_PATH} (GET), {PING_PATH} (GET)")
 
 
 if __name__ == "__main__":
